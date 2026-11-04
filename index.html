@@ -1,0 +1,422 @@
+<style>
+    button:focus, input:focus, select:focus, textarea:focus, [contenteditable]:focus {
+        outline:none;
+    }
+    body {
+        user-select: none;
+    }
+
+    .container {
+        overflow-x: scroll;
+        overflow-y: hidden;
+        height: 110px;
+        white-space: nowrap;
+        margin: 10px;
+    }
+
+    .keyboard {
+        width: auto;
+        padding: 0;
+        margin: 0;
+    }
+
+    .key {
+        cursor: pointer;
+        font: 13px "Open Sans", "Lucida Grande", "Arial", sans-serif;
+        border: 1px solid black;
+        border-radius: 5px;
+        width: 25px;
+        height: 80px;
+        text-align: center;
+        box-shadow: 2px 2px darkgray;
+        display: inline-block;
+        position: relative;
+        margin-right: 3px;
+        user-select: none;
+        -moz-user-select: none;
+        -webkit-user-select: none;
+        -ms-user-select: none;
+    }
+
+    .key div {
+        position: absolute;
+        bottom: 0;
+        text-align: center;
+        width: 100%;
+        pointer-events: none;
+    }
+
+    .key div sub {
+        font-size: 10px;
+        pointer-events: none;
+    }
+
+    .key:hover {
+        background-color: #eeeeff;
+    }
+
+    .key:active, .active {
+        background-color: black;
+        color: white;
+    }
+
+    .octave {
+        display: inline-block;
+        padding-right: 6px;
+    }
+
+    .settingsBar {
+        padding-top: 8px;
+        font: 14px "Open Sans", "Lucida Grande", "Arial", sans-serif;
+        position: relative;
+        vertical-align: middle;
+        width: 100%;
+        height: 30px;
+    }
+
+    .left {
+        width: 50%;
+        position: absolute;
+        left: 0;
+        display: table-cell;
+        vertical-align: middle;
+    }
+
+    .left span, .left input {
+        vertical-align: middle;
+    }
+
+    .right {
+        width: 50%;
+        position: absolute;
+        right: 0;
+        display: table-cell;
+        vertical-align: middle;
+    }
+
+    .right span {
+        vertical-align: middle;
+    }
+
+    .right input {
+        vertical-align: baseline;
+    }
+
+</style>
+<head>
+    <meta property="og:title" content="">
+    <meta property="og:description" content="">
+    <meta property="og:url" content="">
+    <meta name="theme-color" content="">
+    <meta property="og:image" content="">
+</head>
+<body>
+    <div class="container">
+        <div class="keyboard"></div>
+    </div>
+<div class="settingsBar">
+    <div class="left">
+        <span>Volume: </span>
+        <input type="range" min="0.0" max="1.0" step="0.01" value="0.03" list="volumes" name="volume" />
+        <datalist id="volumes">
+            <option value="0.0" label="Mute"></option>
+            <option value="1.0" label="100%"></option>
+        </datalist>
+        <span>Octave: </span>
+        <button id="octDown" title="Arrow Down">-</button>
+        <span id="octLabel">3</span>
+        <button id="octUp" title="Arrow Up">+</button>
+        </div>
+        <div class="right">
+            <span>Current waveform: </span>
+                <select name="waveform">
+                <option value="sine">Sine</option>
+                <option value="square">Square</option>
+                <option value="sawtooth" selected>Sawtooth</option>
+                <option value="triangle">Triangle</option>
+                <option value="organ">Organ</option>
+                <option value="custom">Custom</option>
+            </select>
+        </div>
+    </div>
+</body>
+<script>
+function createNoteTable() {
+  const noteFreq = [
+    { A: 27.5, "A#": 29.13523509488062, B: 30.867706328507754 },
+    {
+      C: 32.70319566257483,
+      "C#": 34.64782887210901,
+      D: 36.70809598967595,
+      "D#": 38.89087296526011,
+      E: 41.20344461410874,
+      F: 43.65352892912549,
+      "F#": 46.2493028389543,
+      G: 48.99942949771866,
+      "G#": 51.91308719749314,
+      A: 55,
+      "A#": 58.27047018976124,
+      B: 61.73541265701551,
+    },
+  ];
+  for (let octave = 2; octave <= 7; octave++) {
+    noteFreq.push(
+      Object.fromEntries(
+        Object.entries(noteFreq[octave - 1]).map(([key, freq]) => [
+          key,
+          freq * 2,
+        ]),
+      ),
+    );
+  }
+  noteFreq.push({ C: 4186.009044809578 });
+  return noteFreq;
+}
+
+const noteTable = createNoteTable();
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+const bus = new EventTarget();
+const emit = (type, detail = {}) => bus.dispatchEvent(new CustomEvent(type, { detail }));
+const on = (type, fn) => bus.addEventListener(type, (e) => fn(e.detail));
+
+class SoundEngine {
+    constructor() {
+        this.ctx = null;
+        this.voices = new Map();
+        this.volume = 0.03;
+        this.waveType = "sawtooth";
+        this.customWaveform = null;
+
+        on("note:on", (d) => this.noteOn(d.note, d.octave));
+        on("note:off", (d) => this.noteOff(d.note, d.octave));
+        on("panic", () => this.allOff());
+        on("volume", (d) => this.setVolume(d.value));
+        on("wave", (d) => { this.waveType = d.type; });
+    }
+
+    init() {
+        if (this.ctx) return;
+        this.ctx = new AudioContext();
+        this.mainGainNode = this.ctx.createGain();
+        this.mainGainNode.gain.value = this.volume;
+        this.mainGainNode.connect(this.ctx.destination);
+
+        const sineTerms = new Float32Array([0, 1, 1, 0, 1]);
+        const cosineTerms = new Float32Array(sineTerms.length);
+        this.customWaveform = this.ctx.createPeriodicWave(cosineTerms, sineTerms);
+    }
+
+    setVolume(v) {
+        this.volume = v;
+        if (this.ctx) this.mainGainNode.gain.value = v;
+    }
+
+    noteOn(note, octave) {
+        this.init();
+        if (this.ctx.state === "suspended") this.ctx.resume();
+        const freq = noteTable[octave] && noteTable[octave][note];
+        if (!freq) return;
+        const id = note + octave;
+        if (this.voices.has(id)) this.release(id, 0.01);
+
+        const t = this.ctx.currentTime;
+        const osc = this.ctx.createOscillator();
+        const env = this.ctx.createGain();
+        if (this.waveType === "organ") {
+            osc.setPeriodicWave(this.customWaveform);
+        } else {
+            osc.type = this.waveType;
+        }
+        osc.frequency.value = freq;
+        env.gain.setValueAtTime(0, t);
+        env.gain.linearRampToValueAtTime(1, t + 0.005);
+        osc.connect(env).connect(this.mainGainNode);
+        osc.start(t);
+        this.voices.set(id, { osc, env });
+    }
+
+    noteOff(note, octave) {
+        this.release(note + octave, 0.06);
+    }
+
+    release(id, time) {
+        const v = this.voices.get(id);
+        if (!v) return;
+        this.voices.delete(id);
+        const t = this.ctx.currentTime;
+        v.env.gain.cancelScheduledValues(t);
+        v.env.gain.setValueAtTime(v.env.gain.value, t);
+        v.env.gain.linearRampToValueAtTime(0, t + time);
+        v.osc.stop(t + time + 0.01);
+        v.osc.onended = () => { v.osc.disconnect(); v.env.disconnect(); };
+    }
+
+    allOff() {
+        [...this.voices.keys()].forEach((id) => this.release(id, 0.06));
+    }
+}
+
+// Shows only the octaves the computer keys can currently reach
+// (the base octave plus the two above it), and redraws on octave change.
+class KeyboardDisplay {
+    constructor(keyboardEl, containerEl, octavesShown) {
+        this.keyboard = keyboardEl;
+        this.container = containerEl;
+        this.octavesShown = octavesShown;
+        this.els = new Map();
+
+        on("note:on", (d) => this.setActive(d.note + d.octave, true));
+        on("note:off", (d) => this.setActive(d.note + d.octave, false));
+        on("panic", () => this.els.forEach((el) => el.classList.remove("active")));
+        on("octave", (d) => this.build(d.base));
+    }
+
+    build(base) {
+        this.keyboard.textContent = "";
+        this.els.clear();
+        for (let octave = base; octave < base + this.octavesShown; octave++) {
+            const octaveElem = document.createElement("div");
+            octaveElem.className = "octave";
+            NOTE_NAMES.forEach((note) => octaveElem.appendChild(this.createKey(note, octave)));
+            this.keyboard.appendChild(octaveElem);
+        }
+        // The next octave's C, which the last key plays.
+        const topElem = document.createElement("div");
+        topElem.className = "octave";
+        topElem.appendChild(this.createKey("C", base + this.octavesShown));
+        this.keyboard.appendChild(topElem);
+        this.container.scrollLeft = 0;
+    }
+
+    createKey(note, octave) {
+        const keyElement = document.createElement("div");
+        const labelElement = document.createElement("div");
+
+        keyElement.className = "key";
+        keyElement.dataset["octave"] = octave;
+        keyElement.dataset["note"] = note;
+        labelElement.appendChild(document.createTextNode(note));
+        labelElement.appendChild(document.createElement("sub")).textContent = octave;
+        keyElement.appendChild(labelElement);
+
+        const detail = { note, octave };
+        const press = (e) => { if (e.buttons & 1) emit("note:on", detail); };
+        const release = () => { if (keyElement.classList.contains("active")) emit("note:off", detail); };
+        keyElement.addEventListener("mousedown", press);
+        keyElement.addEventListener("mouseover", press);
+        keyElement.addEventListener("mouseup", release);
+        keyElement.addEventListener("mouseleave", release);
+
+        this.els.set(note + octave, keyElement);
+        return keyElement;
+    }
+
+    setActive(id, state) {
+        const el = this.els.get(id);
+        if (el) el.classList.toggle("active", state);
+    }
+}
+
+class Input {
+    constructor() {
+        this.keyMap = {
+            // semitones above the base C. Whites sit on the letter rows,
+            // sharps on the row above, only where a real sharp exists.
+            // Three full octaves (0-35), every note on exactly one key.
+            // Lower row (z) starts at C and runs up to E:
+            // C  C# D  D# E  F  F# G  G# A  A# B  C  C# D  D# E
+            KeyZ: 0, KeyS: 1, KeyX: 2, KeyD: 3, KeyC: 4, KeyV: 5, KeyG: 6, KeyB: 7,
+            KeyH: 8, KeyN: 9, KeyJ: 10, KeyM: 11, Comma: 12, KeyL: 13, Period: 14,
+            Semicolon: 15, Slash: 16,
+            // Upper row (q) carries on from F, ending on B:
+            // F  F# G  G# A  A# B  C  C# D  D# E  F  F# G  G# A  A# B
+            KeyQ: 17, Digit2: 18, KeyW: 19, Digit3: 20, KeyE: 21, Digit4: 22, KeyR: 23,
+            KeyT: 24, Digit6: 25, KeyY: 26, Digit7: 27, KeyU: 28, KeyI: 29, Digit9: 30,
+            KeyO: 31, Digit0: 32, KeyP: 33, Minus: 34, BracketLeft: 35,
+            // Next octave: C
+            BracketRight: 36
+        };
+        this.base = 3;
+        this.minBase = 1;
+        this.maxBase = 4;
+        this.held = new Map();
+
+        this.volumeControl = document.querySelector("input[name='volume']");
+        this.wavePicker = document.querySelector("select[name='waveform']");
+        this.octLabel = document.getElementById("octLabel");
+
+        this.volumeControl.addEventListener("change", () => this.sendVolume());
+        this.volumeControl.addEventListener("input", () => this.sendVolume());
+        this.wavePicker.addEventListener("change", () => this.sendWave());
+        document.getElementById("octDown").addEventListener("click", () => this.shift(-1));
+        document.getElementById("octUp").addEventListener("click", () => this.shift(1));
+
+        addEventListener("keydown", (e) => this.keyDown(e));
+        addEventListener("keyup", (e) => this.keyUp(e));
+        addEventListener("blur", () => this.panic());
+    }
+
+    start() {
+        this.sendVolume();
+        this.sendWave();
+        this.publishOctave();
+    }
+
+    sendVolume() { emit("volume", { value: Number(this.volumeControl.value) }); }
+    sendWave() { emit("wave", { type: this.wavePicker.value }); }
+
+    noteFor(code) {
+        const semis = this.keyMap[code];
+        if (semis === undefined) return null;
+        return { note: NOTE_NAMES[semis % 12], octave: this.base + Math.floor(semis / 12) };
+    }
+
+    keyDown(e) {
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.code === "ArrowUp") { e.preventDefault(); return this.shift(1); }
+        if (e.code === "ArrowDown") { e.preventDefault(); return this.shift(-1); }
+        const n = this.noteFor(e.code);
+        if (!n) return;
+        e.preventDefault();
+        if (e.repeat || this.held.has(e.code)) return;
+        this.held.set(e.code, n);
+        emit("note:on", n);
+    }
+
+    keyUp(e) {
+        const n = this.held.get(e.code);
+        if (!n) return;
+        e.preventDefault();
+        this.held.delete(e.code);
+        emit("note:off", n);
+    }
+
+    shift(dir) {
+        const next = Math.min(this.maxBase, Math.max(this.minBase, this.base + dir));
+        if (next === this.base) return;
+        this.panic();
+        this.base = next;
+        this.publishOctave();
+    }
+
+    panic() {
+        this.held.clear();
+        emit("panic");
+    }
+
+    publishOctave() {
+        this.octLabel.textContent = this.base;
+        emit("octave", { base: this.base });
+    }
+}
+
+const engine = new SoundEngine();
+const display = new KeyboardDisplay(
+    document.querySelector(".keyboard"),
+    document.querySelector(".container"),
+    3
+);
+const input = new Input();
+input.start();
+</script>
